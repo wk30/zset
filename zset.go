@@ -2,6 +2,7 @@ package zset
 
 import (
 	"math/rand"
+	"sync"
 )
 
 const zSkiplistMaxlevel = 32
@@ -13,13 +14,13 @@ type (
 	}
 
 	skipListNode struct {
-		objID    int64
+		key      string
 		score    float64
 		backward *skipListNode
 		level    []*skipListLevel
 	}
 	obj struct {
-		key        int64
+		key        string
 		attachment interface{}
 		score      float64
 	}
@@ -32,7 +33,8 @@ type (
 	}
 	// SortedSet is the final exported sorted set we can use
 	SortedSet struct {
-		dict map[int64]*obj
+		sync.RWMutex
+		dict map[string]*obj
 		zsl  *skipList
 	}
 	zrangespec struct {
@@ -42,17 +44,17 @@ type (
 		maxex int32
 	}
 	zlexrangespec struct {
-		minKey int64
-		maxKey int64
+		minKey string
+		maxKey string
 		minex  int
 		maxex  int
 	}
 )
 
-func zslCreateNode(level int16, score float64, id int64) *skipListNode {
+func zslCreateNode(level int16, score float64, key string) *skipListNode {
 	n := &skipListNode{
+		key:   key,
 		score: score,
-		objID: id,
 		level: make([]*skipListLevel, level),
 	}
 	for i := range n.level {
@@ -64,7 +66,7 @@ func zslCreateNode(level int16, score float64, id int64) *skipListNode {
 func zslCreate() *skipList {
 	return &skipList{
 		level:  1,
-		header: zslCreateNode(zSkiplistMaxlevel, 0, 0),
+		header: zslCreateNode(zSkiplistMaxlevel, 0, ""),
 	}
 }
 
@@ -88,7 +90,7 @@ func randomLevel() int16 {
 /* zslInsert a new node in the skiplist. Assumes the element does not already
  * exist (up to the caller to enforce that). The skiplist takes ownership
  * of the passed SDS string 'obj'. */
-func (zsl *skipList) zslInsert(score float64, id int64) *skipListNode {
+func (zsl *skipList) zslInsert(score float64, key string) *skipListNode {
 	update := make([]*skipListNode, zSkiplistMaxlevel)
 	rank := make([]uint64, zSkiplistMaxlevel)
 	x := zsl.header
@@ -102,7 +104,7 @@ func (zsl *skipList) zslInsert(score float64, id int64) *skipListNode {
 		if x.level[i] != nil {
 			for x.level[i].forward != nil &&
 				(x.level[i].forward.score < score ||
-					(x.level[i].forward.score == score && x.level[i].forward.objID < id)) {
+					(x.level[i].forward.score == score && x.level[i].forward.key < key)) {
 				rank[i] += x.level[i].span
 				x = x.level[i].forward
 			}
@@ -122,7 +124,7 @@ func (zsl *skipList) zslInsert(score float64, id int64) *skipListNode {
 		}
 		zsl.level = level
 	}
-	x = zslCreateNode(level, score, id)
+	x = zslCreateNode(level, score, key)
 	for i := int16(0); i < level; i++ {
 		x.level[i].forward = update[i].level[i].forward
 		update[i].level[i].forward = x
@@ -181,14 +183,14 @@ func (zsl *skipList) zslDeleteNode(x *skipListNode, update []*skipListNode) {
  * it is not freed (but just unlinked) and *node is set to the node pointer,
  * so that it is possible for the caller to reuse the node (including the
  * referenced SDS string at node->obj). */
-func (zsl *skipList) zslDelete(score float64, id int64) int {
+func (zsl *skipList) zslDelete(score float64, key string) int {
 	update := make([]*skipListNode, zSkiplistMaxlevel)
 	x := zsl.header
 	for i := zsl.level - 1; i >= 0; i-- {
 		for x.level[i].forward != nil &&
 			(x.level[i].forward.score < score ||
 				(x.level[i].forward.score == score &&
-					x.level[i].forward.objID < id)) {
+					x.level[i].forward.key < key)) {
 			x = x.level[i].forward
 		}
 		update[i] = x
@@ -196,7 +198,7 @@ func (zsl *skipList) zslDelete(score float64, id int64) int {
 	/* We may have multiple elements with the same score, what we need
 	 * is to find the element with both the right score and object. */
 	x = x.level[0].forward
-	if x != nil && score == x.score && x.objID == id {
+	if x != nil && score == x.score && x.key == key {
 		zsl.zslDeleteNode(x, update)
 		return 1
 	}
@@ -292,7 +294,7 @@ func (zsl *skipList) zslLastInRange(ran *zrangespec) *skipListNode {
  * Min and max are inclusive, so a score >= min || score <= max is deleted.
  * Note that this function takes the reference to the hash table view of the
  * sorted set, in order to remove the elements from the hash table too. */
-func (zsl *skipList) zslDeleteRangeByScore(ran *zrangespec, dict map[int64]*obj) uint64 {
+func (zsl *skipList) zslDeleteRangeByScore(ran *zrangespec, dict map[string]*obj) uint64 {
 	removed := uint64(0)
 	update := make([]*skipListNode, zSkiplistMaxlevel)
 	x := zsl.header
@@ -328,7 +330,7 @@ func (zsl *skipList) zslDeleteRangeByScore(ran *zrangespec, dict map[int64]*obj)
 		}
 		next := x.level[0].forward
 		zsl.zslDeleteNode(x, update)
-		delete(dict, x.objID)
+		delete(dict, x.key)
 		// Here is where x->obj is actually released.
 		// And golang has GC, don't need to free manually anymore
 		//zslFreeNode(x)
@@ -338,13 +340,13 @@ func (zsl *skipList) zslDeleteRangeByScore(ran *zrangespec, dict map[int64]*obj)
 	return removed
 }
 
-func (zsl *skipList) zslDeleteRangeByLex(ran *zlexrangespec, dict map[int64]*obj) uint64 {
+func (zsl *skipList) zslDeleteRangeByLex(ran *zlexrangespec, dict map[string]*obj) uint64 {
 	removed := uint64(0)
 
 	update := make([]*skipListNode, zSkiplistMaxlevel)
 	x := zsl.header
 	for i := zsl.level - 1; i >= 0; i-- {
-		for x.level[i].forward != nil && !zslLexValueGteMin(x.level[i].forward.objID, ran) {
+		for x.level[i].forward != nil && !zslLexValueGteMin(x.level[i].forward.key, ran) {
 			x = x.level[i].forward
 		}
 		update[i] = x
@@ -354,24 +356,24 @@ func (zsl *skipList) zslDeleteRangeByLex(ran *zlexrangespec, dict map[int64]*obj
 	x = x.level[0].forward
 
 	/* Delete nodes while in range. */
-	for x != nil && zslLexValueLteMax(x.objID, ran) {
+	for x != nil && zslLexValueLteMax(x.key, ran) {
 		next := x.level[0].forward
 		zsl.zslDeleteNode(x, update)
-		delete(dict, x.objID)
+		delete(dict, x.key)
 		removed++
 		x = next
 	}
 	return removed
 }
 
-func zslLexValueGteMin(id int64, spec *zlexrangespec) bool {
+func zslLexValueGteMin(key string, spec *zlexrangespec) bool {
 	if spec.minex != 0 {
-		return compareKey(id, spec.minKey) > 0
+		return compareKey(key, spec.minKey) > 0
 	}
-	return compareKey(id, spec.minKey) >= 0
+	return compareKey(key, spec.minKey) >= 0
 }
 
-func compareKey(a, b int64) int8 {
+func compareKey(a, b string) int8 {
 	if a == b {
 		return 0
 	} else if a > b {
@@ -380,16 +382,16 @@ func compareKey(a, b int64) int8 {
 	return -1
 }
 
-func zslLexValueLteMax(id int64, spec *zlexrangespec) bool {
+func zslLexValueLteMax(key string, spec *zlexrangespec) bool {
 	if spec.maxex != 0 {
-		return compareKey(id, spec.maxKey) < 0
+		return compareKey(key, spec.maxKey) < 0
 	}
-	return compareKey(id, spec.maxKey) <= 0
+	return compareKey(key, spec.maxKey) <= 0
 }
 
 /* Delete all the elements with rank between start and end from the skiplist.
  * Start and end are inclusive. Note that start and end need to be 1-based */
-func (zsl *skipList) zslDeleteRangeByRank(start, end uint64, dict map[int64]*obj) uint64 {
+func (zsl *skipList) zslDeleteRangeByRank(start, end uint64, dict map[string]*obj) uint64 {
 	update := make([]*skipListNode, zSkiplistMaxlevel)
 	var traversed, removed uint64
 
@@ -407,7 +409,7 @@ func (zsl *skipList) zslDeleteRangeByRank(start, end uint64, dict map[int64]*obj
 	for x != nil && traversed <= end {
 		next := x.level[0].forward
 		zsl.zslDeleteNode(x, update)
-		delete(dict, x.objID)
+		delete(dict, x.key)
 		removed++
 		traversed++
 		x = next
@@ -419,20 +421,20 @@ func (zsl *skipList) zslDeleteRangeByRank(start, end uint64, dict map[int64]*obj
  * Returns 0 when the element cannot be found, rank otherwise.
  * Note that the rank is 1-based due to the span of zsl->header to the
  * first element. */
-func (zsl *skipList) zslGetRank(score float64, key int64) int64 {
+func (zsl *skipList) zslGetRank(score float64, key string) int64 {
 	rank := uint64(0)
 	x := zsl.header
 	for i := zsl.level - 1; i >= 0; i-- {
 		for x.level[i].forward != nil &&
 			(x.level[i].forward.score < score ||
 				(x.level[i].forward.score == score &&
-					x.level[i].forward.objID <= key)) {
+					x.level[i].forward.key <= key)) {
 			rank += x.level[i].span
 			x = x.level[i].forward
 		}
 
 		/* x might be equal to zsl->header, so test if obj is non-NULL */
-		if x.objID == key {
+		if x.key == key {
 			return int64(rank)
 		}
 	}
@@ -462,8 +464,9 @@ func (zsl *skipList) zslGetElementByRank(rank uint64) *skipListNode {
 // New creates a new SortedSet and return its pointer
 func New() *SortedSet {
 	s := &SortedSet{
-		dict: make(map[int64]*obj),
-		zsl:  zslCreate(),
+		RWMutex: sync.RWMutex{},
+		dict:    make(map[string]*obj),
+		zsl:     zslCreate(),
 	}
 	return s
 }
@@ -474,7 +477,8 @@ func (z *SortedSet) Length() int64 {
 }
 
 // Set is used to add or update an element
-func (z *SortedSet) Set(score float64, key int64, dat interface{}) {
+func (z *SortedSet) Set(score float64, key string, dat interface{}) {
+	z.Lock()
 	v, ok := z.dict[key]
 	z.dict[key] = &obj{attachment: dat, key: key, score: score}
 	if ok {
@@ -486,12 +490,15 @@ func (z *SortedSet) Set(score float64, key int64, dat interface{}) {
 	} else {
 		z.zsl.zslInsert(score, key)
 	}
+	z.Unlock()
 }
 
 // IncrBy ..
-func (z *SortedSet) IncrBy(score float64, key int64) (float64, interface{}) {
+func (z *SortedSet) IncrBy(score float64, key string) (float64, interface{}) {
+	z.Lock()
 	v, ok := z.dict[key]
 	if !ok {
+		z.Unlock()
 		// use negative infinity ?
 		return 0, nil
 	}
@@ -500,18 +507,22 @@ func (z *SortedSet) IncrBy(score float64, key int64) (float64, interface{}) {
 		v.score += score
 		z.zsl.zslInsert(v.score, key)
 	}
+	z.Unlock()
 	return v.score, v.attachment
 }
 
 // Delete removes an element from the SortedSet
 // by its key.
-func (z *SortedSet) Delete(key int64) (ok bool) {
+func (z *SortedSet) Delete(key string) (ok bool) {
+	z.Lock()
 	v, ok := z.dict[key]
 	if ok {
 		z.zsl.zslDelete(v.score, key)
 		delete(z.dict, key)
+		z.Unlock()
 		return true
 	}
+	z.Unlock()
 	return false
 }
 
@@ -519,9 +530,11 @@ func (z *SortedSet) Delete(key int64) (ok bool) {
 // found by the parameter key.
 // The parameter reverse determines the rank is descent or ascend，
 // true means descend and false means ascend.
-func (z *SortedSet) GetRank(key int64, reverse bool) (rank int64, score float64, data interface{}) {
+func (z *SortedSet) GetRank(key string, reverse bool) (rank int64, score float64, data interface{}) {
+	z.RLock()
 	v, ok := z.dict[key]
 	if !ok {
+		z.RUnlock()
 		return -1, 0, nil
 	}
 	r := z.zsl.zslGetRank(v.score, key)
@@ -530,25 +543,30 @@ func (z *SortedSet) GetRank(key int64, reverse bool) (rank int64, score float64,
 	} else {
 		r--
 	}
+	z.RUnlock()
 	return int64(r), v.score, v.attachment
-
 }
 
 // GetData returns data stored in the map by its key
-func (z *SortedSet) GetData(key int64) (data interface{}, ok bool) {
-	o, ok := z.dict[key]
+func (z *SortedSet) GetData(key string) (data interface{}, ok bool) {
+	z.RLock()
+	v, ok := z.dict[key]
 	if !ok {
+		z.RUnlock()
 		return nil, false
 	}
-	return o.attachment, true
+	z.RUnlock()
+	return v.attachment, true
 }
 
 // GetDataByRank returns the id,score and extra data of an element which
 // found by position in the rank.
 // The parameter rank is the position, reverse says if in the descend rank.
-func (z *SortedSet) GetDataByRank(rank int64, reverse bool) (key int64, score float64, data interface{}) {
+func (z *SortedSet) GetDataByRank(rank int64, reverse bool) (key string, score float64, data interface{}) {
+	z.RLock()
 	if rank < 0 || rank > z.zsl.length {
-		return 0, 0, nil
+		z.RUnlock()
+		return "", 0, nil
 	}
 	if reverse {
 		rank = z.zsl.length - rank
@@ -557,26 +575,29 @@ func (z *SortedSet) GetDataByRank(rank int64, reverse bool) (key int64, score fl
 	}
 	n := z.zsl.zslGetElementByRank(uint64(rank))
 	if n == nil {
-		return 0, 0, nil
+		z.RUnlock()
+		return "", 0, nil
 	}
-	dat, _ := z.dict[n.objID]
-	if dat == nil {
-		return 0, 0, nil
-	}
+	dat, _ := z.dict[n.key]
+	z.RUnlock()
 	return dat.key, dat.score, dat.attachment
 }
 
 // Range implements ZRANGE
-func (z *SortedSet) Range(start, end int64, f func(float64, int64, interface{})) {
+func (z *SortedSet) Range(start, end int64, f func(float64, string, interface{})) {
+	z.RLock()
 	z.commonRange(start, end, false, f)
+	z.RUnlock()
 }
 
 // RevRange implements ZREVRANGE
-func (z *SortedSet) RevRange(start, end int64, f func(float64, int64, interface{})) {
+func (z *SortedSet) RevRange(start, end int64, f func(float64, string, interface{})) {
+	z.RLock()
 	z.commonRange(start, end, true, f)
+	z.RUnlock()
 }
 
-func (z *SortedSet) commonRange(start, end int64, reverse bool, f func(float64, int64, interface{})) {
+func (z *SortedSet) commonRange(start, end int64, reverse bool, f func(float64, string, interface{})) {
 	l := z.zsl.length
 	if start < 0 {
 		start += l
@@ -610,7 +631,7 @@ func (z *SortedSet) commonRange(start, end int64, reverse bool, f func(float64, 
 	}
 	for span > 0 {
 		span--
-		k := node.objID
+		k := node.key
 		s := node.score
 		f(s, k, z.dict[k].attachment)
 		if reverse {
