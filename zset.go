@@ -473,6 +473,8 @@ func New() *SortedSet {
 
 // Length returns counts of elements
 func (z *SortedSet) Length() int64 {
+	z.RLock()
+	defer z.RUnlock()
 	return z.zsl.length
 }
 
